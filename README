@@ -1,0 +1,142 @@
+Here I breifly summarize how to calibrate the pairwise velocity PDFs of dark matter halos based on the model in Tinker (2007); arXiv:astro-ph/0604217.
+I suppose that you have a halo catalog produced by the ROCKSTAR algorithm (https://code.google.com/archive/p/rockstar/) and the linear matter power
+spectrum at z=0 with CAMB (https://camb.info/) or LAMBDA Web Interface (https://lambda.gsfc.nasa.gov/toolbox/tb_camb_form.cfm).
+ 
+(1) Setup
+
+Run "./set_prog.sh"
+
+You have to install The GNU Scientific Library (https://www.gnu.org/software/gsl/).
+
+For cleaning up, you will run "./clean_prog.sh".
+
+Make sure that you set the current directory in set_prog.sh and clean_prog.sh properly.
+
+(2) ./gen_pdf/gen_pdf_rockstar
+
+This code produces the histogram of the pairwise velocity for dark matter halos from the input ROCKSTAR halo catalog.
+
+HOW TO USE:
+
+"./gen_pdf_rockstar arg1 arg2 arg3"
+
+where 
+
+arg1 : the name of input halo catalog
+arg2 : the name of output file
+arg3 : sets the box size for the halo catalog.
+
+If your catalog is produced from a N-body simulation with the box length of 500 Mpc/h, then set arg3 = 500.
+
+(3) ./save_mass_variance/save_mass_variance_EH
+
+This code computes the non-linear mass variance assuming the linear matter power spectrum without the BAO feature (Eisenstein and Hu 1998; arXiv:astro-ph/9710252). The non-linear mass variance is needed to set the model of the pairwise velocity PDF, because the model needs to set the log-normal PDF for cosmic mass density. The non-linear mass variance is obtained with the halo-fit fitting formula (Takahashi et al. 2012; arXiv:1208.2701).
+
+HOW TO USE:
+
+"./save_mass_variance_EH arg1 arg2 arg3 arg4 arg5 arg6"
+
+where 
+
+arg1 : the name of output
+arg2 : the present-day mean mass density parameter (Omega_{m0})
+arg3 : the present-day hubble parameter in unit of km/s/Mpc/100
+arg4 : the spectral index for the inital curvarure power spectrum (n_s)
+arg5 : the top-hat linear variance with 8 Mpc/h at z=0 (sigma_8)
+arg6 : redshift of interest.
+
+(4) ./fit/fit_mean
+
+This code performs the fitting of the mean pairwise velocity profiles for various halo masses at a given redshift with the model.
+Here the model has three parameters, referred to as A1, A2, and A3. Note A1, A2, and A3 depend on the masses of two halos.
+It holds that A1 = B_{\rho}, A2 = C_{\rho}, and A3 = A_{\rho} in Eq (22) in Shirasaki et al. in prep.
+
+HOW TO USE:
+
+"./fit/fit_mean arg1 arg2 arg3 arg4 arg5 arg6"
+
+where
+
+arg1 : the histogram given by ./gen_pdf/gen_pdf_rockstar at the step (2)
+arg2 : the mass variance given by ./save_mass_variance/save_mass_variance_EH at the step (3)
+arg3 : redshift of interest
+arg4 : the mean mass density parameter (Omega_{m0})
+arg5 : the table for the linear matter power spectrum at z=0 in the CAMB format
+arg6 : the name of output file
+
+(5) ./fit/search_M_z_depend_mean.py
+
+This code seeks for appropriate forms of the fitted parameters (A1, A2, and A3) at the step (4).
+It tries to find the dependence on halo masses. You may need to modify the following parts to have good results:
+
+def fit_func_1D_1(...)
+def fit_func_1D_2(...)
+
+HOW TO USE:
+
+"python ./fit/search_M_z_depend_mean.py arg1 arg2 arg3"
+
+where
+
+arg1 : the file produced by ./fit/fit_mean at the step (4). The file name should include "params_list.dat".
+arg2 : the name of output file (showing if your model can explain the mass dependence of A1, A2, and A3)
+arg3 : set 0, 1, and 2 for A1, A2, and A3, respectively.
+
+(6) ./fit/fit_variance
+
+This code performs the fitting of the variance of the pairwise velocity for various halo masses with the model.
+There are two relevant variances for redshift surveys. For each variance, the model has three parameters.
+Hence, the code finds six best-fit parameters in total (denoted as B1, B2, B3, C1, C2, and C3). These six parameters depend on halo masses.
+
+It holds that B1 = C^{0}_{t}, B2 = C^{1}_{t}, and B3 = p_t in Eq (24) in Shirasaki et al. in prep.
+Also, it holds that C1 = C^{0}_{r}, C2 = C^{1}_{r}, and C3 = C^{2}_{r} in Eq (24) in Shirasaki et al. in prep.
+
+Before running, you have to change the following part in fit_variance.c:
+
+double cond_Prob_delta_param(double r, double m1, double m2, double b1, double b2)
+
+This function returns A_1 * [r/r_max(m1, m2)]^{A_2} + A_3 * [b1+b2] where A1(m1,m2), A2(m1,m2) and A3(m1,m2) are set at the step (5).
+Note that m1 is the mass of halo 1 and b1 is the linear halo bias of halo 1, and so on. The term of r_max is defined by
+
+r_max(m1,m2) = MAX [ r_200b(m1), r_200b(m2)]
+
+where r_200b(m) is the spherical overdensity radius with respect to 200 times mean mass density for the halo of m.
+After setting the function of cond_Prob_delta_param(...), you need to run "./set_prog.sh" again.
+
+HOW TO USE:
+
+"./fit/fit_variance arg1 arg2 arg3 arg4 arg5 arg6"
+
+where
+
+arg1 : the histogram given by ./gen_pdf/gen_pdf_rockstar at the step (2)
+arg2 : the mass variance given by ./save_mass_variance/save_mass_variance_EH at the step (3)
+arg3 : redshift of interest
+arg4 : the mean mass density parametr (Omega_{m0})
+arg5 : the table for the linear matter power spectrum at z=0 in the CAMB format
+arg6 : the name of output file
+
+(7) ./fit/search_M_z_depend_variance.py
+
+This codes search for appropriate forms of the fitted parameters (B1, B2, B3, C1, C2, and C3) at the step (6).
+It tries to find the dependence on halo masses. You may need to modify the following parts to have good results:
+
+def fit_func_1D_1(...)
+def fit_func_1D_2(...)
+
+HOW TO USE:
+
+"python ./fit/search_M_z_depend_variance.py arg1 arg2 arg3 arg4"
+
+where
+
+arg1 : the file produced by ./fit/fit_variance at the step (6). The file name should include "params_list.dat".
+arg2 : the name of output file (showing if your model can explain the mass dependence of B1-B3 or C1-C3)
+arg3 : set 0 when working with B1-B3, 1 for C1-C3.
+arg4 : set 0 for B1 or C1, 1 for B2 or C2, and 2 for B3 or C3.
+
+---------------------------
+
+Masato Shirasaki
+masato.shirasaki@nao.ac.jp
+July 31, 2020

@@ -1,0 +1,1463 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <inttypes.h> 
+#include <gsl/gsl_vector.h>
+#include <gsl/gsl_integration.h>
+#include <gsl/gsl_math.h>
+#include <gsl/gsl_sf.h>
+#include <gsl/gsl_multimin.h>
+#include <gsl/gsl_cdf.h>
+#include <gsl/gsl_multifit_nlin.h>
+#include <gsl/gsl_rng.h>
+
+#define NR_END 1
+#define FREE_ARG char*
+
+#define TINY (1e-48)
+#define nMbin 8
+#define Nrbin 200
+#define Nvbin 100
+#define Ndbin 100
+#define Nr_use_max 200
+
+/*Cosmology*/
+static double Omega, OmegaLambda;
+static double r_tophat, bling;
+static char TransTable[256];
+static double xp[1000], yp[1000], yp2[1000];
+static double tab_r[1000], tab_sig2[1000], err_sig2[1000];
+static int np, np_sig2;
+
+const double vel_cut = 2500.0; // km/s
+
+void readCMB_and_do_spline();
+double PowerSpec(double k);
+double GrowthFactor(double astart, double aend);
+double growth(double a);
+double growth_int(double);
+double sigma2_int(double k);
+double TopHatSigma2(double R);
+double sigma_m(double m, double *rsphere_return);
+double weight(double x, double rsphere);
+double evar2(double x, double rsphere);
+double var2(double x, double rsphere);
+double unnsigma(double rsphere);
+double halo_bias(double logm);
+
+double TopHatSigma2_NL_fast(double R);
+double PDF_mass_NL(double density, double sigm);
+
+/*Numerical Recipe*/
+void polint(double xa[], double ya[], int n, double x, double *y, double *dy);
+double trapzd(double (*func)(double), double a, double b, int n);
+double qromb(double (*func)(double), double a, double b);
+void spline(double x[], double y[], int n, double yp1, double ypn, double y2[]);
+void splint(double xa[], double ya[], double y2a[], int n, double x, double *y);
+void splie2(double x1a[], double x2a[], double **ya, int m, int n, double **y2a);
+void splin2(double x1a[], double x2a[], double **ya, double **y2a, int m, int n, double x1, double x2, double *y);
+void nrerror(char error_text[]);
+double *dvector(long nl, long nh);
+void free_dvector(double *v, long nl, long nh);
+double **dmatrix(long nrl, long nrh, long ncl, long nch);
+void free_dmatrix(double **m, long nrl, long nrh, long ncl, long nch);
+
+static int nd, OPT, switch_skewness, mean_v_fixed;
+static double tab_v[Nvbin], sig2_fit, rbin_fit, tab_rpbin[Nrbin], tab_rpibin[Nrbin], tab_bias[nMbin], tab_Rhalo[nMbin];
+static double *pdf_v_fit, *err_pdf_v_fit, M1_fit, M2_fit, b1_fit, b2_fit;
+static double Hubble_z, F_omega, Sigma8, F_omega_norm, Omega_z, zhalo;
+
+static double params_rho_PDF[3], params_rho_200r[5], params_rho_200t[5];
+
+double mean_func(double delta);
+double var_func(double delta, double p1, double p2);
+
+double func_vr(double x, double *p);
+double func_vt(double x, double *p);
+
+double moment1_vr(double *p);
+double moment2_vr(double *p);
+double moment2_vt(double *p);
+
+void set_data(char *fname_base1, int bin_ID, int bin_rID);
+
+double cond_Prob_delta_param(double r, double m1, double m2, double b1, double b2);
+double std_r_velocity_param(double r, double m1, double m2);
+double std_t_velocity_param(double r, double m1, double m2);
+
+/*fitting paramaters' range*/
+const double pmin1 = 1e-3;
+const double pmax1 = 10.0;
+
+const double pmin2 = 0.01;
+const double pmax2 = 100.0;
+
+const double pmin3 = 0.2;
+const double pmax3 = 2.0;
+
+const double pmin4 = 0.2;
+const double pmax4 = 2.0;
+
+const double pmin5 = 0.2;
+const double pmax5 = 2.0;
+
+double func_search_best_fit(const gsl_vector *v, void *params);
+double search_best_fit(double *out);
+
+struct fit_data{
+  double xx[Nrbin];
+  double yy[2*Nrbin];
+  double zz[2*Nrbin];
+
+  double npairs[2];
+};
+
+static struct fit_data D;
+
+int main(int argc, char *argv[])
+{
+  int i,j,iMbin,jMbin;
+	
+  if(argc!=7){
+    printf("usage: %s input_vpdf input_mass_variance redshift Omega Pk_at_z0 output\n", argv[0]);
+    return 1;
+  }
+
+  // initialize
+  char fname1[256], fname2[256];
+  sprintf(fname1, "%s", argv[1]);
+  sprintf(fname2, "%s", argv[2]);
+  double zhere = atof(argv[3]);
+  Omega = atof(argv[4]);
+  sprintf(TransTable, "%s", argv[5]);
+
+  readCMB_and_do_spline();
+  bling = GrowthFactor(1.0, 1./(1.+zhere));
+  Hubble_z = 100.0 * sqrt(Omega*pow(1+zhere,3)+OmegaLambda) / (1+zhere);
+  zhalo = zhere;
+  double dlna = 0.01;
+  double lnap = log(1./(1.+zhere)) +dlna; 
+  double lnam = log(1./(1.+zhere)) -dlna; 
+  F_omega = log(growth(exp(lnap))/growth(exp(lnam)))/(2*dlna); // dlnD/dlna ~ Omega^0.55
+  Sigma8 = sqrt(TopHatSigma2(8.0)) * bling;
+  fprintf(stdout, "%e %e %e\n", Hubble_z, F_omega, Sigma8);
+  Omega_z = Omega*pow(1+zhere, 3)/(Omega*pow(1+zhere,3)+OmegaLambda);
+
+  FILE *fin;
+  fin = fopen(fname2, "r");
+  if(fin == NULL){
+    fprintf(stderr, "can not find %s.\n", fname2);
+    exit(1);
+  }
+  
+  char readline[2048];
+  np_sig2 = 0;
+  while(fgets(readline, 2048, fin)) np_sig2 += 1;
+  fclose(fin);
+
+  if(np_sig2 > 1000){
+    fprintf(stderr, "too many data points are found in %s\n", fname2);
+    exit(1);
+  }
+ 
+  fin = fopen(fname2, "r");
+  for(i=0;i<np_sig2;i++){
+    fscanf(fin, "%lf %lf\n", &tab_r[i], &tab_sig2[i]);
+    tab_r[i] = log10(tab_r[i]);
+    tab_sig2[i] = log10(tab_sig2[i]);
+  }
+  fclose(fin);
+
+  double yp1 = 1.e31;
+  double ypn = 1.e31;
+  spline(tab_r-1, tab_sig2-1, np_sig2, yp1, ypn, err_sig2-1);
+
+  // do fitting
+
+  pdf_v_fit = malloc(sizeof(double)*Nvbin*2);
+  err_pdf_v_fit = malloc(sizeof(double)*Nvbin*2);
+
+  if(pdf_v_fit == NULL || err_pdf_v_fit == NULL){
+    fprintf(stderr, "cannot malloc pdf_fit and err_pdf_fit\n");
+    exit(1);
+  }
+
+  double logMmin = 11.0;
+  double logMmax = 15.0;
+  double dlogM = (logMmax-logMmin)/nMbin;
+
+  double tab_logM[nMbin];
+  for(i=0;i<nMbin;i++){
+    tab_logM[i] = logMmin + dlogM * (i+0.5);
+    double logm = tab_logM[i];
+    tab_bias[i] = halo_bias(logm);
+    tab_Rhalo[i] = pow(3*pow(10.0, logm) / (4*M_PI*2.7754e11*Omega*200.0), 0.333333);
+  }
+
+  FILE *flist;
+  char pname[256];
+  sprintf(pname, "%s_params_list.dat", argv[6]);
+  
+  flist = fopen(pname, "w");
+  if(flist == NULL){
+    fprintf(stderr, "cannot make %s.\n", pname);
+    exit(1);
+  }
+   
+  int index_Mbin_tot = 0;
+  for(iMbin=2;iMbin<nMbin;iMbin++){
+    int jMstart = (iMbin <= 2) ? 2 : iMbin;
+    for(jMbin=jMstart;jMbin<nMbin;jMbin++){
+
+      fprintf(stdout, "iMbin=%d jMbin=%d\n", iMbin, jMbin);
+
+      double m1 = (4*M_PI*2.7754e11*Omega*200.0) * pow(tab_Rhalo[iMbin], 3) /3.;
+      double m2 = (4*M_PI*2.7754e11*Omega*200.0) * pow(tab_Rhalo[jMbin], 3) /3.;
+	
+      double b1 = tab_bias[iMbin];
+      double b2 = tab_bias[jMbin];
+
+      M1_fit = m1;
+      M2_fit = m2;
+      b1_fit = b1;
+      b2_fit = b2;
+
+      int ir;
+      for(ir=0;ir<Nrbin;ir++){
+	set_data(fname1, index_Mbin_tot, ir);	
+      }
+
+      int togo = 0;
+      int ndata[2] = {0, 0};
+      for(ir=0;ir<Nrbin;ir++){
+	if(D.zz[ir+0*Nrbin]>0 && D.xx[ir]/(tab_Rhalo[iMbin]+tab_Rhalo[jMbin]) >= 1.0){
+	  ndata[0] += 1;
+	}
+	if(D.zz[ir+1*Nrbin]>0 && D.xx[ir]/(tab_Rhalo[iMbin]+tab_Rhalo[jMbin]) >= 1.0){
+	  ndata[1] += 1;
+	}
+      }
+
+      if(ndata[0] >10 && ndata[1] > 10) togo = 1;
+
+      double out1[5], out2[5];
+      double chisq1, chisq2;
+      
+      if(togo == 1){
+
+	OPT = 0; chisq1 = search_best_fit(out1);
+
+	if(chisq1>0){
+      
+	  params_rho_200t[0] = out1[0] * pow(7.2, 2.5);
+	  params_rho_200t[1] = out1[1] * pow(12.6, 0.8);
+	  params_rho_200t[2] = 0.45;
+	  params_rho_200t[3] = out1[2] * (-2.5);
+	  params_rho_200t[4] = (-0.9);
+	  
+	  FILE *fp;
+	  char oname[256];
+	  sprintf(oname, "%s_sigmat_Mbin%d_%d.dat", argv[6], iMbin, jMbin);
+
+	  fp = fopen(oname, "w");
+	  if(fp == NULL){
+	    fprintf(stderr, "can not make %s.\n", oname);
+	    exit(1);
+	  }
+
+	  int ir;
+	  for(ir=0;ir<Nrbin;ir++){
+
+	    rbin_fit = D.xx[ir];
+	    sig2_fit = TopHatSigma2_NL_fast(rbin_fit);
+
+	    double p1 = cond_Prob_delta_param(rbin_fit, m1, m2, b1, b2);
+	    double p2 = std_t_velocity_param(rbin_fit,  m1, m2);
+
+	    double p_vt[2] = {p1, p2};
+
+	    double res;
+	
+	    res = moment2_vt(p_vt);
+		    		 	     	    	  
+	    fprintf(fp, "%e %e %e %e\n", rbin_fit, res, D.yy[ir], D.zz[ir]);
+	  }
+	  fclose(fp);
+
+	}else{
+	  params_rho_200t[0] = out1[0];
+	  params_rho_200t[1] = out1[1];
+	  params_rho_200t[3] = out1[2];	  
+	}
+
+	OPT = 1; chisq2 = search_best_fit(out2);
+
+	if(chisq2>0){
+
+	  params_rho_200r[0] = out2[0] * pow(5.0, 4);
+	  params_rho_200r[1] = out2[1] * pow(11.5, 1.3);
+	  params_rho_200r[2] = out2[2] * 0.50;
+	  params_rho_200r[3] = (-4.0);
+	  params_rho_200r[4] = (-1.3);
+      	  
+	  FILE *fp;
+	  char oname[256];
+	  sprintf(oname, "%s_sigmar_Mbin%d_%d.dat", argv[6], iMbin, jMbin);
+
+	  fp = fopen(oname, "w");
+	  if(fp == NULL){
+	    fprintf(stderr, "can not make %s.\n", oname);
+	    exit(1);
+	  }
+
+	  int ir;
+	  for(ir=0;ir<Nrbin;ir++){
+
+	    rbin_fit = D.xx[ir];
+	    sig2_fit = TopHatSigma2_NL_fast(rbin_fit);
+
+	    //fprintf(stdout, "#"); fflush(stdout);
+	    double p1 = cond_Prob_delta_param(rbin_fit, m1, m2, b1, b2);
+	    double p2 = std_r_velocity_param(rbin_fit,  m1, m2);
+
+	    double p_vr[2] = {p1, p2};
+
+	    double res;
+	
+	    res = moment2_vr(p_vr);
+		    		 	     	    	  
+	    fprintf(fp, "%e %e %e %e\n", rbin_fit, res, D.yy[ir+1*Nrbin], D.zz[ir+1*Nrbin]);
+	  }
+	  fclose(fp);
+
+	}else{
+	  params_rho_200r[0] = out2[0] ;
+	  params_rho_200r[1] = out2[1] ;
+	  params_rho_200r[2] = out2[2] ;	  
+	}
+	
+      }else{
+
+	params_rho_200t[0] = -1e10;
+	params_rho_200t[1] = -1e10;
+	params_rho_200t[3] = -1e10;
+	chisq1 = -1e10;
+
+	params_rho_200r[0] = -1e10;
+	params_rho_200r[1] = -1e10;
+	params_rho_200r[2] = -1e10;
+	chisq2 = -1e10;
+
+      }
+
+      fprintf(flist, "%e %e %e %e %e %e %e %e %e %e\n", M1_fit, M2_fit, b1_fit, b2_fit, 
+	      params_rho_200t[0], params_rho_200t[1], params_rho_200t[3], 
+	      params_rho_200r[0], params_rho_200r[1], params_rho_200r[2]);
+
+      index_Mbin_tot += 1;
+      fprintf(stdout, "\n");    
+    }
+  }
+
+  fclose(flist);
+
+  free(pdf_v_fit);
+  free(err_pdf_v_fit);  
+
+  fprintf(stdout, "DONE\n");
+
+  return 0;
+}
+
+double PowerSpec(double k)
+{
+  int i;
+  double lk;
+  double pow_index;
+
+  //k *= 1000.0; /* convert to h/Mpc */
+
+  lk=log10(k);
+
+  if(lk < xp[0]){
+    double dummy = (yp[2]-yp[1])/(xp[2]-xp[1])*(lk-xp[1])+yp[1];
+    return pow(10.,dummy);
+  } /* usually should not be executed */
+  if(lk > xp[np-1]){
+    double dummy = (yp[np-2]-yp[np-1])/(xp[np-2]-xp[np-1])*(lk-xp[np-1])+yp[np-1];
+    return pow(10.,dummy);
+    //return pow(10.,yp[np-1])*pow(k/pow(10.,xp[np-1]),-2.);
+    //return pow(10.,yp[np-1]);
+  }
+
+  splint(xp-1, yp-1, yp2-1, np, lk, &pow_index);
+
+  return pow(10.0,pow_index);
+
+}
+
+
+//==================================================
+void readCMB_and_do_spline()
+{
+  int i,iline;
+  double yp1,ypn;
+  char tfunc_table[100];
+  int  errorFlag=0;
+  FILE *fd;
+
+  sprintf(tfunc_table,"%s",TransTable);
+
+  fprintf(stdout,"Reading %s .\n",tfunc_table);
+  iline=0;
+  double dummy1,dummy2,dummy3,dummy4,dummy5;
+  fd=fopen(tfunc_table,"r");
+  if(fd != NULL){
+    while(!feof(fd)){
+      fscanf(fd,"%lf %lf\n",&xp[iline],&yp[iline]);
+      //fprintf(stdout,"%g %g \n",xp[iline],yp[iline]);
+      iline++; 
+    }
+    fclose(fd);
+  }
+  else{
+    fprintf(stdout,"transfer function file %s not found.\n",tfunc_table);
+    exit(1);
+  }
+
+  fprintf(stdout,"read in %d data points \n",iline);
+
+  np=iline;
+
+  for(i=0;i<iline;i++){
+    xp[i]=log10(xp[i]);
+    yp[i]=log10(yp[i]);
+  }
+
+  yp1 = 1.e31;
+  ypn = 1.e31;
+
+  spline(xp-1, yp-1, iline, yp1, ypn, yp2-1);
+
+}
+
+//==================================================
+inline double TopHatSigma2(double R)
+{
+  r_tophat= R;
+
+  return qromb(sigma2_int, 0, 1000/R);
+}
+
+double TopHatSigma2_NL_fast(double R){
+
+  int i;
+  double lk;
+  double pow_index;
+
+  lk=log10(R);
+
+  if(R < pow(10., tab_r[0])){
+    double dummy = (tab_sig2[1]-tab_sig2[0])/(tab_r[1]-tab_r[0])*(lk-tab_r[0])+tab_sig2[0];
+    return pow(10.,dummy);
+  }
+  if(R > pow(10.,tab_r[np_sig2-1])){
+    double dummy = (tab_sig2[np_sig2-2]-tab_sig2[np_sig2-1])/(tab_r[np_sig2-2]-tab_r[np_sig2-1])*(lk-tab_r[np_sig2-1])+tab_sig2[np_sig2-1];
+    return pow(10.,dummy);
+  }
+
+  splint(tab_r-1, tab_sig2-1, err_sig2-1, np_sig2, lk, &pow_index);
+
+  return pow(10.0,pow_index);  
+}
+
+
+//==================================================
+double sigma2_int(double k)
+{
+  double kr,kr3,kr2,wf,x;
+
+  kr=r_tophat*k;
+  kr2=kr*kr;
+  kr3=kr2*kr;
+
+  if(kr<1e-8) return 0;
+
+  wf=3*( sin(kr)/kr3-cos(kr)/kr2 ); 
+  x=4*M_PI*k*k*wf*wf*PowerSpec(k)/pow(2*M_PI,3.);
+
+  return x;
+}
+
+double GrowthFactor(double astart, double aend)
+{
+  return growth(aend)/growth(astart);
+}
+
+double growth(double a)
+{
+  double hubble_a;
+
+  hubble_a= sqrt(Omega/(a*a*a) + (1-Omega-OmegaLambda)/(a*a) + OmegaLambda);
+
+  return hubble_a*qromb(growth_int, 0, a);
+
+}
+
+double growth_int(double a)
+{
+  return pow(a / (Omega + (1-Omega-OmegaLambda)*a + OmegaLambda*a*a*a), 1.5);
+}
+
+double var2(double x, double rsphere)
+{
+  double res,pspec,xk;
+  res=weight(x, rsphere)*PowerSpec(x)*bling*bling;
+
+  return res;
+}
+
+double evar2(double x, double rsphere)
+{
+  double rk,res;
+
+  rk = exp(x);
+  res = var2(rk, rsphere)*rk;
+
+  return res;
+}
+
+double weight(double x, double rsphere) 
+{
+  // Tophat filter * k^2
+  // there appears to be appreciable differences between C-version and fortran
+  double y,res,yinv,yinv2;
+
+  y=rsphere*x;
+  yinv=1.0/y;
+  yinv2=yinv*yinv;
+
+  res=36.0*M_PI*x*x* pow((sin(y)/y-cos(y))*yinv2, 2)/pow(2*M_PI,3);
+
+  if(sin(y)/y - cos(y) < TINY)
+    res=0;
+
+  return res;
+}
+
+double sigma_m(double m, double *rsphere_return)
+{
+  //   Use unit of mass where 1h^{-1}Mpc^3 has mass 1
+
+  double res,rsphere,ling,aend;
+
+  rsphere = pow((3.*m/4./M_PI), 0.33333333333);
+  *rsphere_return = rsphere;
+
+  res = sqrt(unnsigma(rsphere));
+
+  return res;
+}
+
+double unnsigma(double rsphere)
+{
+  int i,j,k;
+  double dxk=0.01,xk;
+  double sum=0;
+
+  for(i=0;i<=4000;i++){
+    xk=-20.0 + dxk*i;
+    sum += evar2(xk, rsphere)*dxk;
+  }
+
+  return sum;
+}
+
+double halo_bias(double logm){ //based on peak-background split
+
+  double delta=1.68647;
+  double sqrt_two_over_pi=0.79788456;
+  double sqrt_two=1.414213562;
+  double fdeltac;
+  double rho_crit=2.7754e11;
+  double rm,rmass,sig,ans,fract;
+  double r, res;
+
+  rm = pow(10,logm);
+  rmass = rm/rho_crit/Omega;
+
+  sig = sigma_m(rmass, &r);
+
+  double Nu;
+
+  //Tinker et al 2010 arXiv:1001.3162
+  Nu = 1.686/sig;
+  double a1,a2,b1,b2,c1,c2;
+  double Delta=200;
+  double y = log10(Delta);
+  a1 = 1.0+0.24*y*exp(-pow(4./y,4.));
+  a2 = 0.44*y-0.88;
+  b1 = 0.183;
+  b2 = 1.5;
+  c1 = 0.019+0.107*y+0.19*exp(-pow(4./y,4.));
+  c2 = 2.4;
+  res = 1.0-a1*(pow(Nu,a2))/(pow(Nu,a2)+pow(1.686,a2))+b1*pow(Nu,b2)+c1*pow(Nu,c2);
+     
+  //Tinker et al 2005 https://arxiv.org/abs/astro-ph/0411777
+  /*
+    double a = 0.707;
+    double b = 0.35;
+    double c = 0.80;
+    Nu = delta/sig;
+    res = 1.0 + 1./sqrt(a)/delta * (sqrt(a)*(a*Nu*Nu)+sqrt(a)*b*pow(a*Nu*Nu, 1-c) - pow(a*Nu*Nu,c)/(pow(a*Nu*Nu,c)+b*(1-c)*(1-0.5*c)));
+  */
+
+  return res;
+}
+
+
+#define FUNC(x) ((*func)(x))
+double trapzd(double (*func)(double), double a, double b, int n)
+{
+  double x,tnm,sum,del;
+  static double s;
+  int it,j;
+
+  if (n == 1) {
+    return (s=0.5*(b-a)*(FUNC(a)+FUNC(b)));
+  } else {
+    for (it=1,j=1;j<n-1;j++) it <<= 1;
+    tnm=it;
+    del=(b-a)/tnm;
+    x=a+0.5*del;
+    for (sum=0.0,j=1;j<=it;j++,x+=del) sum += FUNC(x);
+    s=0.5*(s+(b-a)*sum/tnm);
+    return s;
+  }
+}
+#undef FUNC
+
+#define NRANSI
+void polint(double xa[], double ya[], int n, double x, double *y, double *dy)
+{
+  int i,m,ns=1;
+  double den,dif,dift,ho,hp,w;
+  double *c,*d;
+
+  dif=fabs(x-xa[1]);
+  c=dvector(1,n);
+  d=dvector(1,n);
+  for (i=1;i<=n;i++) {
+    if ( (dift=fabs(x-xa[i])) < dif) {
+      ns=i;
+      dif=dift;
+    }
+    c[i]=ya[i];
+    d[i]=ya[i];
+  }
+  *y=ya[ns--];
+  for (m=1;m<n;m++) {
+    for (i=1;i<=n-m;i++) {
+      ho=xa[i]-x;
+      hp=xa[i+m]-x;
+      w=c[i+1]-d[i];
+      if ( (den=ho-hp) == 0.0) nrerror((char *)"Error in routine polint");
+      den=w/den;
+      d[i]=hp*den;
+      c[i]=ho*den;
+    }
+    *y += (*dy=(2*ns < (n-m) ? c[ns+1] : d[ns--]));
+  }
+  free_dvector(d,1,n);
+  free_dvector(c,1,n);
+}
+#undef NRANSI
+
+#define EPS 1.0e-5
+#define JMAX 40
+#define JMAXP (JMAX+1)
+#define K 5
+double qromb(double (*func)(double), double a, double b)
+{
+  double ss,dss;
+  double s[JMAXP],h[JMAXP+1];
+  int j;
+
+  h[1]=1.0;
+  for (j=1;j<=JMAX;j++) {
+    s[j]=trapzd(func,a,b,j);
+    if (j >= K) {
+      polint(&h[j-K],&s[j-K],K,0.0,&ss,&dss);
+      if (fabs(dss) <= EPS*fabs(ss)) return ss;
+    }
+    h[j+1]=0.25*h[j];
+  }
+  nrerror((char *)"Too many steps in routine qromb");
+  return 0.0;
+}
+#undef EPS
+#undef JMAX
+#undef JMAXP
+#undef K
+
+void spline(double x[], double y[], int n, double yp1, double ypn, double y2[])
+{
+  int i,k;
+  double p,qn,sig,un;
+  double  *u;
+	
+  u=dvector(1,n-1);
+  if (yp1 > 0.99e30)
+    y2[1]=u[1]=0.0;
+  else {
+    y2[1] = -0.5;
+    u[1]=(3.0/(x[2]-x[1]))*((y[2]-y[1])/(x[2]-x[1])-yp1);
+  }
+  for (i=2;i<=n-1;i++) {
+    sig=(x[i]-x[i-1])/(x[i+1]-x[i-1]);
+    p=sig*y2[i-1]+2.0;
+    y2[i]=(sig-1.0)/p;
+    u[i]=(y[i+1]-y[i])/(x[i+1]-x[i]) - (y[i]-y[i-1])/(x[i]-x[i-1]);
+    u[i]=(6.0*u[i]/(x[i+1]-x[i-1])-sig*u[i-1])/p;
+  }
+  if (ypn > 0.99e30)
+    qn=un=0.0;
+  else {
+    qn=0.5;
+    un=(3.0/(x[n]-x[n-1]))*(ypn-(y[n]-y[n-1])/(x[n]-x[n-1]));
+  }
+  y2[n]=(un-qn*u[n-1])/(qn*y2[n-1]+1.0);
+  for (k=n-1;k>=1;k--)
+    y2[k]=y2[k]*y2[k+1]+u[k];
+  free_dvector(u,1,n-1);
+}
+
+void splint(double xa[], double ya[], double y2a[], int n, double x, double *y)
+{
+  void nrerror(char error_text[]);
+  int klo,khi,k;
+  double h,b,a;
+	
+  klo=1;
+  khi=n;
+  while (khi-klo > 1) {
+    k=(khi+klo) >> 1;
+    if (xa[k] > x) khi=k;
+    else klo=k;
+  }
+  h=xa[khi]-xa[klo];
+  if (h == 0.0){
+    //printf("n %d khi %d, klo %d, xa[khi] %g x %g xa[0]%g xa[n]%g \n",n,khi,klo,xa[khi],x,xa[0],xa[n]);
+    nrerror("Bad xa input to routine splint");
+  }
+  a=(xa[khi]-x)/h;
+  b=(x-xa[klo])/h;
+  *y=a*ya[klo]+b*ya[khi]+((a*a*a-a)*y2a[klo]+(b*b*b-b)*y2a[khi])*(h*h)/6.0;
+}
+
+void splie2(double x1a[], double x2a[], double **ya, int m, int n, double **y2a){
+  int j;
+  for(j=1;j<=m;j++){
+    spline(x2a,ya[j],n,1.e31,1.e31,y2a[j]);
+  }
+}
+void splin2(double x1a[], double x2a[], double **ya, double **y2a, int m, int n, double x1, double x2, double *y){
+  int j;
+  double *ytmp,*yytmp;
+	
+  ytmp=dvector(1,n);
+  yytmp=dvector(1,n);
+	
+  for(j=1;j<=m;j++){
+    splint(x2a,ya[j],y2a[j],n,x2,&yytmp[j]);
+  }
+  spline(x1a,yytmp,m,1.e31,1.e31,ytmp);
+  splint(x1a,yytmp,ytmp,m,x1,y);
+  free_dvector(yytmp,1,n);
+  free_dvector(ytmp,1,n);
+}
+
+void nrerror(char error_text[])
+/* Numerical Recipes standard error handler */
+{
+  fprintf(stderr,"Numerical Recipes run-time error...\n");
+  fprintf(stderr,"%s\n",error_text);
+  fprintf(stderr,"...now exiting to system...\n");
+  exit(1);
+}
+
+double *dvector(long nl, long nh)
+/* allocate a double vector with subscript range v[nl..nh] */
+{
+  double *v;
+	
+  v=(double *)malloc((size_t) ((nh-nl+1+NR_END)*sizeof(double)));
+  if (!v) nrerror("allocation failure in dvector()");
+  return v-nl+NR_END;
+}
+
+void free_dvector(double *v, long nl, long nh)
+/* free a double vector allocated with dvector() */
+{
+  free((FREE_ARG) (v+nl-NR_END));
+}
+
+double **dmatrix(long nrl, long nrh, long ncl, long nch)
+/* allocate a double matrix with subscript range m[nrl..nrh][ncl..nch] */
+{
+  long i, nrow=nrh-nrl+1,ncol=nch-ncl+1;
+  double **m;
+	
+  /* allocate pointers to rows */
+  m=(double **) malloc((size_t)((nrow+NR_END)*sizeof(double*)));
+  if (!m) nrerror("allocation failure 1 in matrix()");
+  m += NR_END;
+  m -= nrl;
+	
+  /* allocate rows and set pointers to them */
+  m[nrl]=(double *) malloc((size_t)((nrow*ncol+NR_END)*sizeof(double)));
+  if (!m[nrl]) nrerror("allocation failure 2 in matrix()");
+  m[nrl] += NR_END;
+  m[nrl] -= ncl;
+	
+  for(i=nrl+1;i<=nrh;i++) m[i]=m[i-1]+ncol;
+	
+  /* return pointer to array of pointers to rows */
+  return m;
+}
+
+void free_dmatrix(double **m, long nrl, long nrh, long ncl, long nch)
+/* free a double matrix allocated by dmatrix() */
+{
+  free((FREE_ARG) (m[nrl]+ncl-NR_END));
+  free((FREE_ARG) (m+nrl-NR_END));
+}
+
+double mean_func(double delta){
+  
+  double deltac = 1.686;
+  // Eq (B2) in https://arxiv.org/pdf/1305.5548.pdf
+  double mu_sc = -Hubble_z * rbin_fit * F_omega / 3 * deltac * (pow(1+delta, 1./deltac)-1.0); 
+  return mu_sc;
+
+}
+
+double var_func(double delta, double p1, double p2){
+
+  // see https://arxiv.org/pdf/astro-ph/0604217.pdf
+  double alpha = p2 * pow(rbin_fit/35.0, 0.10);
+  double res = 200.0 * pow(Omega_z/0.3, 0.55) * (Sigma8 / 0.8) * pow((1+delta)/p1, alpha);
+
+  return res;
+}
+
+double func_vr(double x, double *p){
+
+  double p_d   = p[0];
+  double p_vr1 = p[1];
+  double p_vr2 = 1.0;
+  
+  int i;
+  double res = 0;  
+  double sum = 0;
+
+  double sig2 = sig2_fit;
+  double ln_sig = sqrt(log(1+sig2));
+  double dmin = -5.0 * ln_sig - 0.5*ln_sig*ln_sig; // log(1+delta)
+  double dmax = +5.0 * ln_sig - 0.5*ln_sig*ln_sig;
+  double width = (dmax-dmin)/Ndbin;
+
+  double norm_d;
+  if(dmax < log(p_d)){
+    norm_d = PDF_mass_NL(exp(dmax)-1, sig2);
+  }else{
+    if(dmin > log(p_d)){
+      norm_d = 0.0;
+    }else{
+      norm_d = PDF_mass_NL(p_d-1, sig2);
+    }
+  }
+  
+  for(i=0;i<Ndbin;i++){
+    double delta = exp(dmin+(i+0.5)*width)-1.0;
+    double mu_r = mean_func(delta);
+    double sig_r = var_func(delta, p_vr1, p_vr2);
+
+    res += exp(PDF_mass_NL(delta, sig2)-norm_d - p_d / (1+delta)) * exp(-0.5*pow(x-mu_r,2)/sig_r/sig_r)/sqrt(2*M_PI)/sig_r * width;
+    sum += exp(PDF_mass_NL(delta, sig2)-norm_d - p_d / (1+delta)) * width;
+  }
+
+  if(sum > 0) res = res/sum;
+
+  if(isnan(res)){
+    fprintf(stderr, "found NaN in [func_vr] at v=%e, p1=%e, p2=%e\n", x, p[0], p[1], 1.0);
+    exit(1);
+  }
+
+  return res;
+
+}
+
+double func_vt(double x, double *p){
+
+  double p_d   = p[0];
+  double p_vr1 = p[1];
+  double p_vr2 = 1.0;
+  
+  int i;
+  double res = 0;  
+  double sum = 0;
+
+  double sig2 = sig2_fit;
+  double ln_sig = sqrt(log(1+sig2));
+  double dmin = -5.0 * ln_sig - 0.5*ln_sig*ln_sig; // log(1+delta)
+  double dmax = +5.0 * ln_sig - 0.5*ln_sig*ln_sig;
+  double width = (dmax-dmin)/Ndbin;
+
+  double norm_d;
+  if(dmax < log(p_d)){
+    norm_d = PDF_mass_NL(exp(dmax)-1, sig2);
+  }else{
+    if(dmin > log(p_d)){
+      norm_d = 0.0;
+    }else{
+      norm_d = PDF_mass_NL(p_d-1, sig2);
+    }
+  }
+  
+  for(i=0;i<Ndbin;i++){
+    double delta = exp(dmin+(i+0.5)*width)-1.0;
+    double mu_r = 0.0;
+    double sig_r = var_func(delta, p_vr1, p_vr2);
+
+    res += exp(PDF_mass_NL(delta, sig2)-norm_d - p_d / (1+delta)) * exp(-0.5*pow(x-mu_r,2)/sig_r/sig_r)/sqrt(2*M_PI)/sig_r * width;
+    sum += exp(PDF_mass_NL(delta, sig2)-norm_d - p_d / (1+delta)) * width;
+  }
+
+  if(sum > 0) res = res/sum;
+
+  if(isnan(res)){
+    fprintf(stderr, "found NaN in [func_vt] at v=%e,p1=%e,p2=%e\n", x, p[0], p[1], 1.0);
+    exit(1);
+  }
+
+  return res;
+
+}
+
+
+double moment1_vr(double *p){
+
+  double norm_f = 0;
+  double moment = 0;
+
+  int j;
+  for(j=0;j<Nvbin;j++){
+
+    double vel = tab_v[j];
+    double y = func_vr(vel, p);
+
+    if(fabs(vel) < vel_cut){
+      norm_f += y;
+      moment += y * vel;
+    }
+
+  }
+
+  if(norm_f > 0){
+    moment = moment / norm_f;
+  }
+
+  return moment;
+    
+}
+
+double moment2_vr(double *p){
+
+  double norm_f = 0;
+  double mean = 0;
+  double moment = 0;
+
+  int j;
+  for(j=0;j<Nvbin;j++){
+
+    double vel = tab_v[j];
+    double y = func_vr(vel, p);
+
+    if(fabs(vel) < vel_cut){
+      norm_f += y;
+      mean += y * vel;
+    }
+
+  }
+
+  if(norm_f > 0){
+    mean = mean / norm_f;
+  }
+
+  for(j=0;j<Nvbin;j++){
+
+    double vel = tab_v[j];
+    double y = func_vr(vel, p);
+
+    if(fabs(vel) < vel_cut){
+      moment += y * (vel-mean) * (vel-mean);
+    }
+
+  }
+
+  if(norm_f > 0){
+    moment = moment / norm_f;
+  }
+
+  return moment;
+}
+
+double moment2_vt(double *p){
+
+  double norm_f = 0;
+  double mean = 0;
+  double moment = 0;
+
+  int j;
+  for(j=0;j<Nvbin;j++){
+
+    double vel = tab_v[j];
+    double y = func_vt(vel, p);
+
+    if(fabs(vel) < vel_cut){
+      norm_f += y;
+      mean += y * vel;
+    }
+
+  }
+
+  if(norm_f > 0){
+    mean = mean / norm_f;
+  }
+
+  for(j=0;j<Nvbin;j++){
+
+    double vel = tab_v[j];
+    double y = func_vt(vel, p);
+
+    if(fabs(vel) < vel_cut){
+      moment += y * (vel-mean) * (vel-mean);
+    }
+
+  }
+
+  if(norm_f > 0){
+    moment = moment / norm_f;
+  }
+
+  return moment;
+
+}
+
+void set_data(char *fname_base1, int bin_ID, int bin_rID){
+
+  int i,j;
+  int iMbin, jMbin;
+      
+  FILE *fp;
+  char fname[256];
+  char readline[2048];
+
+  int index_Mbin_tot;
+
+  index_Mbin_tot = 0;
+  for(iMbin=2;iMbin<nMbin;iMbin++){
+    int jMstart = (iMbin <= 2) ? 2 : iMbin;
+    for(jMbin=jMstart;jMbin<nMbin;jMbin++){
+
+      if(index_Mbin_tot == bin_ID){
+
+	sprintf(fname, "%s_Mbin%d_%d.dat", fname_base1, iMbin, jMbin);
+
+	fp = fopen(fname, "r");
+	if(fp == NULL){
+	  fprintf(stderr, "cannot find %s.\n", fname);
+	  exit(1);
+	}
+  
+	fgets(readline, 2048, fp);
+	fgets(readline, 2048, fp);
+
+	int ir;
+	for(ir=0;ir<Nrbin;ir++){
+	  double rmin, rmax, norm, width;
+	  fscanf(fp, "%s %lf %lf %lf %lf\n", readline, &rmin, &rmax, &norm, &width);
+
+	  double rhere = 0.5*(rmin+rmax);
+	  	
+	  double sum_pdf[2] = {0, 0};
+
+	  for(j=0;j<Nvbin;j++){
+
+	    double dum[7];
+	    fscanf(fp, "%lf %lf %lf %lf\n", &dum[0], &dum[1], &dum[2], &dum[3]);
+
+	    if(fabs(dum[0]) < vel_cut){
+	      sum_pdf[0] += dum[1];
+	      sum_pdf[1] += dum[2];
+	    }
+
+	    if(ir == bin_rID){	      
+	    
+	      tab_v[j] = dum[0];
+	      D.xx[bin_rID] = rhere;
+
+	      if(norm > 0){
+		pdf_v_fit[j+0*Nvbin] = dum[1] / norm;
+		err_pdf_v_fit[j+0*Nvbin] = sqrt(dum[1]) / norm;
+		pdf_v_fit[j+1*Nvbin] = dum[2] / norm;
+		err_pdf_v_fit[j+1*Nvbin] = sqrt(dum[2]) / norm;
+	      }else{
+		pdf_v_fit[j+0*Nvbin] = 0.0;
+		err_pdf_v_fit[j+0*Nvbin] = 0.0;
+		pdf_v_fit[j+1*Nvbin] = 0.0;
+		err_pdf_v_fit[j+1*Nvbin] = 0.0;
+	      }	      	      
+	    }
+
+	  }
+
+	  if(ir == bin_rID){
+	    D.npairs[0] = sum_pdf[0];
+	    D.npairs[1] = sum_pdf[1];
+	  }
+	  	      
+	}
+	fclose(fp);
+      }
+      index_Mbin_tot += 1;    
+    }
+  }
+  	  
+  int icase;
+  for(icase=0;icase<2;icase++){
+
+    if(D.npairs[icase] > 100 ){
+
+      double norm_f = 0;
+      double mean = 0;
+      double var = 0;
+
+      for(j=0;j<Nvbin;j++){
+	      
+	double vel = tab_v[j];
+	double yobs;
+	yobs = pdf_v_fit[j+icase*Nvbin] / (tab_v[1]-tab_v[0]);
+	      
+	if(fabs(vel) < vel_cut){
+	  norm_f += yobs;
+	  mean += yobs * vel;
+	}
+
+      }
+
+      if(norm_f > 0) mean = mean / norm_f;
+
+      for(j=0;j<Nvbin;j++){
+	      
+	double vel = tab_v[j];
+	double yobs;
+	yobs = pdf_v_fit[j+icase*Nvbin] / (tab_v[1]-tab_v[0]);	      
+	if(fabs(vel) < vel_cut){	       
+	  var += yobs * (vel-mean)*(vel-mean);
+	}
+
+      }
+
+      if(norm_f > 0) var = var / norm_f;
+
+      D.yy[bin_rID+icase*Nrbin] = var ; 
+      D.zz[bin_rID+icase*Nrbin] = var * sqrt(2./D.npairs[icase]);
+    
+    }else{
+      D.yy[bin_rID+icase*Nrbin] = -1e10; 
+      D.zz[bin_rID+icase*Nrbin] = -1e10;
+    }
+  }
+  
+}
+
+double PDF_mass_NL(double density, double sigm){
+
+  double sig1 = log(1+sigm);
+  double res = -pow(log(1+density)+sig1/2,2)/2/sig1 - 0.5*log(2*M_PI*sig1);
+  return res;
+
+}
+
+// you have to set this functional form by using fit_mean.c and search_M_z_depend_mean.py
+double cond_Prob_delta_param(double r, double m1, double m2, double b1, double b2){ 
+
+  double rho_crit = 2.7754e11;
+  double rhom_comv = rho_crit*Omega;
+  double r1 = pow(3*m1/(4*M_PI*200.0*rhom_comv), 0.3333);
+  double r2 = pow(3*m2/(4*M_PI*200.0*rhom_comv), 0.3333);
+  
+  double x = (r1>r2) ? r/(r1) : r/(r2);
+  double y = b1+b2;
+
+  double a1, a2, a3;
+
+  double ms = (m1+m2)/1e13;
+
+  double c1, c2, c3;
+  c1 = 26.7*zhalo*zhalo+2.83*zhalo+17.4;
+  c2 = 0.631;
+ 
+  params_rho_PDF[0] = c1 * pow(ms, c2);
+
+  c1 = 0.109 * (zhalo-0.189) * (zhalo-0.189) + 0.862;
+  c2 = -0.0223 * (zhalo-0.438) * (zhalo-0.438) + 0.204;
+
+  params_rho_PDF[1] = -1.* c1 * pow(ms, c2);
+
+  c1 = 0.0385 * pow(1+zhalo, -6.47) + 1.04;
+  c2 = 0.488 * pow(zhalo, 3.21) + 0.737;
+  c3 = -0.710 * (zhalo-0.310) * (zhalo-0.310) + 5.93;
+
+  params_rho_PDF[2] = c1 * pow(c2*bling*y, c3) / (1.0+pow(c2*bling*y, c3));
+
+  a1 = params_rho_PDF[0];
+  a2 = params_rho_PDF[1];
+  a3 = params_rho_PDF[2];
+
+  double g = a1 * pow(x, a2) + a3 * y;
+  return g;
+
+}
+
+double std_r_velocity_param(double r, double m1, double m2){
+  
+  double rho_crit = 2.7754e11;
+  double rhom_comv = rho_crit*Omega;
+
+  double r1, r2;
+  r1 = pow(3*m1/(4*M_PI*rhom_comv*200.0), 0.333);
+  r2 = pow(3*m2/(4*M_PI*rhom_comv*200.0), 0.333);
+  
+  double x0, y0, a1, a2, a3;
+
+  double x = (r1 > r2) ? r/sqrt(r1) : r/sqrt(r2);
+  double y = r/sqrt(r1+r2);
+
+  x0 = params_rho_200r[0];
+  y0 = params_rho_200r[1];
+  a3 = params_rho_200r[2];
+
+  a1 = params_rho_200r[3];
+  a2 = params_rho_200r[4];
+  
+  return x0*pow(x, a1) + y0*pow(y, a2) + a3;
+
+}
+
+double std_t_velocity_param(double r, double m1, double m2){
+
+  double rho_crit = 2.7754e11;
+  double rhom_comv = rho_crit*Omega;
+
+  double r1, r2;
+  r1 = pow(3*m1/(4*M_PI*rhom_comv*200.0), 0.333);
+  r2 = pow(3*m2/(4*M_PI*rhom_comv*200.0), 0.333);
+  
+  double x0, y0, a1, a2, a3;
+
+  double x = (r1 > r2) ? r/sqrt(r1) : r/sqrt(r2);
+  double y = r/sqrt(r1+r2);
+
+  x0 = params_rho_200t[0];
+  y0 = params_rho_200t[1];
+  a3 = params_rho_200t[2];
+
+  a1 = params_rho_200t[3];
+  a2 = params_rho_200t[4];
+  
+  return x0*pow(x, a1) + y0*pow(y, a2) + a3;
+
+}
+
+double func_search_best_fit(const gsl_vector *v, void *params){
+
+  double rho_crit = 2.7754e11;
+  double rhom_comv = rho_crit*Omega;
+
+  double r1, r2;
+  r1 = pow(3*M1_fit/(4*M_PI*rhom_comv*200.0), 0.333);
+  r2 = pow(3*M2_fit/(4*M_PI*rhom_comv*200.0), 0.333);
+    
+  double p[5];
+  p[0] = pmin1 + (pmax1-pmin1)/(1+exp(gsl_vector_get(v, 0)));
+  p[1] = pmin2 + (pmax2-pmin2)/(1+exp(gsl_vector_get(v, 1)));
+  p[2] = pmin3 + (pmax3-pmin3)/(1+exp(gsl_vector_get(v, 2)));
+  //if(OPT == 1) p[3] = pmin4 + (pmax4-pmin4)/(1+exp(gsl_vector_get(v, 3)));
+  //p[4] = pmin5 + (pmax5-pmin5)/(1+exp(gsl_vector_get(v, 4)));
+
+  if(OPT==1){
+    params_rho_200r[0] = p[0] * pow(5.0, 4);
+    params_rho_200r[1] = p[1] * pow(11.5, 1.3);
+    params_rho_200r[2] = p[2] * 0.50;
+    params_rho_200r[3] = (-4.0);
+    params_rho_200r[4] = (-1.3);
+  }
+  if(OPT==0){
+    params_rho_200t[0] = p[0] * pow(7.2, 2.5);
+    params_rho_200t[1] = p[1] * pow(12.6, 0.8);
+    params_rho_200t[2] = 0.45;
+    params_rho_200t[3] = p[2] * (-2.5);
+    params_rho_200t[4] = (-0.9);
+  }
+
+  struct fit_data *d = (struct data *) params;
+
+  int i, j;
+  
+  double res = 0;
+
+  for(i=0;i<Nrbin;i++){
+
+    if(d->xx[i]/(r1+r2) >= 1.0 && d->zz[i+OPT*Nrbin] > 0){
+
+      rbin_fit = d->xx[i];
+      sig2_fit = TopHatSigma2_NL_fast(rbin_fit);
+
+      double p1 = cond_Prob_delta_param(rbin_fit, M1_fit, M2_fit, b1_fit, b2_fit);
+
+      if(OPT == 0){
+	double p2 = std_t_velocity_param(rbin_fit, M1_fit, M2_fit);
+	double p_v[2] = {p1, p2};
+	res += pow(d->yy[i+OPT*Nrbin]-moment2_vt(p_v), 2)/pow(d->zz[i+OPT*Nrbin], 2);
+      }
+      if(OPT == 1){
+	double p2 = std_r_velocity_param(rbin_fit, M1_fit, M2_fit);
+	double p_v[2] = {p1, p2};
+	res += pow(d->yy[i+OPT*Nrbin]-moment2_vr(p_v), 2)/pow(d->zz[i+OPT*Nrbin], 2);
+      }
+    }		    		 	     	    	  
+  }
+
+  return res;
+
+}
+
+double search_best_fit(double *out){
+  
+  int i;
+  const gsl_multimin_fminimizer_type *T = gsl_multimin_fminimizer_nmsimplex2;
+  gsl_multimin_fminimizer *s = NULL;
+  gsl_vector *ss, *x;
+  gsl_multimin_function minex_func;
+
+  int nparams = 3;
+      
+  x = gsl_vector_alloc(nparams);
+  ss = gsl_vector_alloc(nparams);
+  s = gsl_multimin_fminimizer_alloc(T, nparams);
+	       
+  size_t iter = 0;
+  int status =0;
+  double size;
+	
+  //initial guess
+  double xinit[5];
+
+  xinit[0] = 1.0;
+  xinit[1] = 1.0;
+  xinit[2] = 1.0;
+  xinit[3] = 1.0;
+  xinit[4] = 1.0;
+
+  //printf("init = %e %e %e\n", xinit[0], xinit[1], xinit[2]);
+	  
+  xinit[0] = log((pmax1-pmin1)/(xinit[0]-pmin1)-1);
+  xinit[1] = log((pmax2-pmin2)/(xinit[1]-pmin2)-1);
+  xinit[2] = log((pmax3-pmin3)/(xinit[2]-pmin3)-1);
+  xinit[3] = log((pmax4-pmin4)/(xinit[3]-pmin4)-1);
+  xinit[4] = log((pmax5-pmin5)/(xinit[4]-pmin5)-1);
+	
+  for(i=0;i<nparams;i++) gsl_vector_set(x, i, xinit[i]);
+
+  //set the width of first steps
+  gsl_vector_set_all (ss, 1.0);
+
+  //initialize
+  minex_func.n = nparams;
+  minex_func.f = &func_search_best_fit;
+  minex_func.params = &D;
+	
+  gsl_multimin_fminimizer_set(s, &minex_func, x, ss);
+	
+  do {
+    iter++;
+    status = gsl_multimin_fminimizer_iterate(s);
+    if (status) break;
+    size = gsl_multimin_fminimizer_size(s);
+    status = gsl_multimin_test_size (size, 1e-2);
+
+    if(iter > 0 && iter%30 == 0){
+      fprintf(stdout, "%zu %e %e\n", iter, 
+	      func_search_best_fit(s->x, (void *)&D), size);	      
+    }
+    if (status == GSL_SUCCESS){
+	fprintf(stdout, "converged to minimum at\n");
+	fprintf(stdout, "%zu %e %e %e %e\n", iter, 
+		gsl_vector_get(s->x, 0), 
+		gsl_vector_get(s->x, 1),
+		gsl_vector_get(s->x, 2),
+		//gsl_vector_get(s->x, 3),
+		//gsl_vector_get(s->x, 4),
+		func_search_best_fit(s->x, (void *)&D));	      
+    }
+  }while (status == GSL_CONTINUE && iter < 5000);
+    
+  double res = func_search_best_fit(s->x, (void *)&D);
+  if(isnan(res)){
+
+    out[0] = -1e10;
+    out[1] = -1e10;
+    out[2] = -1e10;
+    //if(OPT == 1)out[3] = -1e10;
+    //out[4] = -1e10;
+    res = -1e10;
+
+  }else{
+
+    if(gsl_vector_get(s->x, 0) < -10 || gsl_vector_get(s->x, 0) > 10){
+      out[0] = -1e10;
+      out[1] = -1e10;
+      out[2] = -1e10;
+      res = -1e10;
+    }
+    if(gsl_vector_get(s->x, 1) < -10 || gsl_vector_get(s->x, 1) > 10){
+      out[0] = -1e10;
+      out[1] = -1e10;
+      out[2] = -1e10;
+      res = -1e10;
+    }
+    if(gsl_vector_get(s->x, 2) < -10 || gsl_vector_get(s->x, 2) > 10){
+      out[0] = -1e10;
+      out[1] = -1e10;
+      out[2] = -1e10;
+      res = -1e10;
+    }
+
+    if(res > 0){
+      out[0] = pmin1 + (pmax1-pmin1)/(1+exp(gsl_vector_get(s->x, 0)));
+      out[1] = pmin2 + (pmax2-pmin2)/(1+exp(gsl_vector_get(s->x, 1)));
+      out[2] = pmin3 + (pmax3-pmin3)/(1+exp(gsl_vector_get(s->x, 2)));
+    }
+
+  }
+
+  gsl_vector_free(x);
+  gsl_vector_free(ss);
+  gsl_multimin_fminimizer_free(s);
+
+  return res;
+
+}
