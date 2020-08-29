@@ -1,6 +1,7 @@
 Here I breifly summarize how to calibrate the pairwise velocity PDFs of dark matter halos based on the model in Tinker (2007); arXiv:astro-ph/0604217.
 I suppose that you have a halo catalog produced by the ROCKSTAR algorithm (https://code.google.com/archive/p/rockstar/) and the linear matter power
 spectrum at z=0 with CAMB (https://camb.info/) or LAMBDA Web Interface (https://lambda.gsfc.nasa.gov/toolbox/tb_camb_form.cfm).
+More details are found in https://arxiv.org/abs/2008.02960.
  
 (1) Setup
 
@@ -49,7 +50,7 @@ arg6 : redshift of interest.
 
 This code performs the fitting of the mean pairwise velocity profiles for various halo masses at a given redshift with the model.
 Here the model has three parameters, referred to as A1, A2, and A3. Note A1, A2, and A3 depend on the masses of two halos.
-It holds that A1 = B_{\rho}, A2 = C_{\rho}, and A3 = A_{\rho} in Eq (22) in Shirasaki et al. in prep.
+It holds that A1 = B_{\rho}, A2 = C_{\rho}, and A3 = A_{\rho} in Eq (22) in https://arxiv.org/abs/2008.02960.
 
 HOW TO USE:
 
@@ -88,8 +89,8 @@ This code performs the fitting of the variance of the pairwise velocity for vari
 There are two relevant variances for redshift surveys. For each variance, the model has three parameters.
 Hence, the code finds six best-fit parameters in total (denoted as B1, B2, B3, C1, C2, and C3). These six parameters depend on halo masses.
 
-It holds that B1 = C^{0}_{t}, B2 = C^{1}_{t}, and B3 = p_t in Eq (24) in Shirasaki et al. in prep.
-Also, it holds that C1 = C^{0}_{r}, C2 = C^{1}_{r}, and C3 = C^{2}_{r} in Eq (24) in Shirasaki et al. in prep.
+It holds that B1 = C^{0}_{t}, B2 = C^{1}_{t}, and B3 = p_t in Eq (24) in https://arxiv.org/abs/2008.02960.
+Also, it holds that C1 = C^{0}_{r}, C2 = C^{1}_{r}, and C3 = C^{2}_{r} in Eq (24) in https://arxiv.org/abs/2008.02960.
 
 Before running, you have to change the following part in fit_variance.c:
 
@@ -139,4 +140,4 @@ arg4 : set 0 for B1 or C1, 1 for B2 or C2, and 2 for B3 or C3.
 
 Masato Shirasaki
 masato.shirasaki@nao.ac.jp
-July 31, 2020
+August 28, 2020
